@@ -1,6 +1,6 @@
-import org.apache.tools.ant.taskdefs.condition.Os
-import java.util.Properties
 import java.io.FileInputStream
+import java.util.Properties
+import org.apache.tools.ant.taskdefs.condition.Os
 
 val keystorePropertiesFile = rootProject.file("keystore.properties")
 val useKeystoreProperties = keystorePropertiesFile.canRead()
@@ -28,6 +28,7 @@ android {
                 storePassword = keystoreProperties["storePassword"] as String
                 keyAlias = keystoreProperties["keyAlias"] as String
                 keyPassword = keystoreProperties["keyPassword"] as String
+                enableV4Signing = true
             }
 
             create("play") {
@@ -39,17 +40,20 @@ android {
         }
     }
 
-    compileSdk = 34
-    buildToolsVersion = "34.0.0"
+    compileSdk = 35
+    buildToolsVersion = "35.0.0"
 
     namespace = "app.grapheneos.pdfviewer"
 
     defaultConfig {
         minSdk = 21
-        resourceConfigurations.add("en")
     }
 
     buildTypes {
+        getByName("debug") {
+            resValue("string", "app_name", "PDF Viewer d")
+        }
+
         getByName("release") {
             if (useKeystoreProperties) {
                 signingConfig = signingConfigs.getByName("release")
@@ -71,8 +75,9 @@ android {
 }
 
 dependencies {
-    implementation("androidx.appcompat:appcompat:1.6.1")
-    implementation("androidx.core:core:1.13.1")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("androidx.core:core-ktx:1.16.0")
+    implementation("androidx.fragment:fragment-ktx:1.8.6")
     implementation("com.google.android.material:material:1.12.0")
 }
 

@@ -12,9 +12,9 @@ import android.view.Menu;
 import android.view.MenuInflater;
 import android.view.MenuItem;
 import android.view.View;
-import android.view.ViewGroup;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
+import android.webkit.RenderProcessGoneDetail;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
@@ -23,27 +23,15 @@ import android.webkit.WebViewClient;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.activity.EdgeToEdge;
 import androidx.annotation.NonNull;
 import androidx.annotation.RequiresApi;
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.core.graphics.Insets;
-import androidx.core.view.ViewCompat;
-import androidx.core.view.WindowCompat;
-import androidx.core.view.WindowInsetsCompat;
 import androidx.fragment.app.Fragment;
+import androidx.fragment.app.FragmentTransaction;
 import androidx.lifecycle.ViewModelProvider;
 import androidx.loader.app.LoaderManager;
 import androidx.loader.content.Loader;
-
-import com.google.android.material.snackbar.Snackbar;
-
-import app.grapheneos.pdfviewer.databinding.PdfviewerBinding;
-import app.grapheneos.pdfviewer.fragment.DocumentPropertiesFragment;
-import app.grapheneos.pdfviewer.fragment.PasswordPromptFragment;
-import app.grapheneos.pdfviewer.fragment.JumpToPageFragment;
-import app.grapheneos.pdfviewer.ktx.ViewKt;
-import app.grapheneos.pdfviewer.loader.DocumentPropertiesAsyncTaskLoader;
-import app.grapheneos.pdfviewer.viewModel.PasswordStatus;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -53,8 +41,17 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 
+import app.grapheneos.pdfviewer.databinding.PdfviewerBinding;
+import app.grapheneos.pdfviewer.fragment.DocumentPropertiesFragment;
+import app.grapheneos.pdfviewer.fragment.JumpToPageFragment;
+import app.grapheneos.pdfviewer.fragment.PasswordPromptFragment;
+import app.grapheneos.pdfviewer.ktx.ViewKt;
+import app.grapheneos.pdfviewer.loader.DocumentPropertiesAsyncTaskLoader;
+import app.grapheneos.pdfviewer.outline.OutlineFragment;
+import app.grapheneos.pdfviewer.viewModel.PdfViewModel;
+
 public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequence>> {
-    public static final String TAG = "PdfViewer";
+    private static final String TAG = "PdfViewer";
 
     private static final String KEY_PROPERTIES = "properties";
     private static final int MIN_WEBVIEW_RELEASE = 92;
@@ -62,7 +59,7 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
     private static final String CONTENT_SECURITY_POLICY =
         "default-src 'none'; " +
         "form-action 'none'; " +
-        "connect-src https://localhost/placeholder.pdf; " +
+        "connect-src 'self'; " +
         "img-src blob: 'self'; " +
         "script-src 'self'; " +
         "style-src 'self'; " +
@@ -101,16 +98,20 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
         "xr-spatial-tracking=()";
 
     private static final float MIN_ZOOM_RATIO = 0.2f;
-    private static final float MAX_ZOOM_RATIO = 1.5f;
+    private static final float MAX_ZOOM_RATIO = 10f;
+    private static final int MAX_RENDER_PIXELS = 1 << 23; // 8 mega-pixels
     private static final int ALPHA_LOW = 130;
     private static final int ALPHA_HIGH = 255;
     private static final int STATE_LOADED = 1;
     private static final int STATE_END = 2;
     private static final int PADDING = 10;
 
+    private boolean webViewCrashed;
     public int mPage;
     public int mNumPages;
     private float mZoomRatio = 1f;
+    private float mZoomFocusX = 0f;
+    private float mZoomFocusY = 0f;
     private int mDocumentOrientationDegrees;
     private int mDocumentState;
     private String mEncryptedDocumentPassword;
@@ -125,9 +126,19 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
     String fileName;
     Long fileSize;
     private PasswordPromptFragment mPasswordPromptFragment;
-    public PasswordStatus passwordValidationViewModel;
+    public PdfViewModel viewModel;
 
     private class Channel {
+        @JavascriptInterface
+        public void setHasDocumentOutline(final boolean hasOutline) {
+            viewModel.setHasOutline(hasOutline);
+        }
+
+        @JavascriptInterface
+        public void setDocumentOutline(final String outline) {
+            viewModel.parseOutlineString(outline);
+        }
+
         @JavascriptInterface
         public int getPage() {
             return mPage;
@@ -141,6 +152,21 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
         @JavascriptInterface
         public void setZoomRatio(final float ratio) {
             mZoomRatio = Math.max(Math.min(ratio, MAX_ZOOM_RATIO), MIN_ZOOM_RATIO);
+        }
+
+        @JavascriptInterface
+        public int getMaxRenderPixels() {
+            return MAX_RENDER_PIXELS;
+        }
+
+        @JavascriptInterface
+        public float getZoomFocusX() {
+            return mZoomFocusX;
+        }
+
+        @JavascriptInterface
+        public float getZoomFocusY() {
+            return mZoomFocusY;
         }
 
         @JavascriptInterface
@@ -180,17 +206,17 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
             if (!getPasswordPromptFragment().isAdded()) {
                 getPasswordPromptFragment().show(activity.getSupportFragmentManager(), PasswordPromptFragment.class.getName());
             }
-            passwordValidationViewModel.passwordMissing();
+            viewModel.passwordMissing();
         }
 
         @JavascriptInterface
         public void invalidPassword() {
-            activity.runOnUiThread(() -> passwordValidationViewModel.invalid());
+            activity.runOnUiThread(() -> viewModel.invalid());
         }
 
         @JavascriptInterface
         public void onLoaded() {
-            passwordValidationViewModel.validated();
+            viewModel.validated();
             if (getPasswordPromptFragment().isAdded()) {
                 getPasswordPromptFragment().dismiss();
             }
@@ -202,37 +228,55 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
         }
     }
 
+    private void showWebViewCrashed() {
+        binding.webviewAlertTitle.setText(activity.getString(R.string.webview_crash_title));
+        binding.webviewAlertMessage.setText(activity.getString(R.string.webview_crash_message));
+        binding.webviewAlertLayout.setVisibility(View.VISIBLE);
+        binding.webviewAlertReload.setVisibility(View.VISIBLE);
+        binding.webview.setVisibility(View.GONE);
+    }
+
     public PdfViewer(@NonNull AppCompatActivity activity) {
         this.activity = activity;
         binding = PdfviewerBinding.inflate(activity.getLayoutInflater());
         activity.setContentView(binding.getRoot());
         activity.setSupportActionBar(binding.toolbar);
-        passwordValidationViewModel = new ViewModelProvider(activity, ViewModelProvider.AndroidViewModelFactory.getInstance(activity.getApplication())).get(PasswordStatus.class);
+        viewModel = new ViewModelProvider(activity, ViewModelProvider.AndroidViewModelFactory.getInstance(activity.getApplication())).get(PdfViewModel.class);
 
-        WindowCompat.setDecorFitsSystemWindows(activity.getWindow(), false);
+        viewModel.getOutline().observe(activity, requested -> {
+            if (requested instanceof PdfViewModel.OutlineStatus.Requested) {
+                viewModel.setLoadingOutline();
+                binding.webview.evaluateJavascript("getDocumentOutline()", null);
+            }
+        });
+
+        activity.getSupportFragmentManager().setFragmentResultListener(OutlineFragment.RESULT_KEY, activity,
+                (requestKey, result) -> {
+            final int newPage = result.getInt(OutlineFragment.PAGE_KEY, -1);
+            if (viewModel.shouldAbortOutline()) {
+                Log.d(TAG, "aborting outline operations");
+                binding.webview.evaluateJavascript("abortDocumentOutline()", null);
+                viewModel.clearOutline();
+            } else {
+                onJumpToPageInDocument(newPage);
+            }
+        });
+
+        EdgeToEdge.enable(activity);
 
         // Margins for the toolbar are needed, so that content of the toolbar
         // is not covered by a system button navigation bar when in landscape.
-        ViewCompat.setOnApplyWindowInsetsListener(binding.toolbar, (v, windowInsets) -> {
-            Insets insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars());
-            ViewGroup.MarginLayoutParams mlp = (ViewGroup.MarginLayoutParams) v.getLayoutParams();
-            mlp.leftMargin = insets.left;
-            mlp.rightMargin = insets.right;
-            v.setLayoutParams(mlp);
-            return windowInsets;
-        });
+        KtUtilsKt.applySystemBarMargins(binding.toolbar, false);
 
         binding.webview.setBackgroundColor(Color.TRANSPARENT);
-
-        if (BuildConfig.DEBUG) {
-            WebView.setWebContentsDebuggingEnabled(true);
-        }
 
         final WebSettings settings = binding.webview.getSettings();
         settings.setAllowContentAccess(false);
         settings.setAllowFileAccess(false);
+        settings.setBlockNetworkLoads(true);
         settings.setCacheMode(WebSettings.LOAD_NO_CACHE);
         settings.setJavaScriptEnabled(true);
+        settings.setLayoutAlgorithm(WebSettings.LayoutAlgorithm.NORMAL);
         settings.setMinimumFontSize(1);
 
         CookieManager.getInstance().setAcceptCookie(false);
@@ -282,8 +326,30 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
                     return fromAsset("text/css", path);
                 }
 
-                if ("/viewer/js/index.js".equals(path) || "/viewer/js/worker.js".equals(path)) {
+                if ("/viewer/js/index.js".equals(path) || "/viewer/js/worker.js".equals(path) ||
+                        "/viewer/wasm/openjpeg_nowasm_fallback.js".equals(path)) {
                     return fromAsset("application/javascript", path);
+                }
+
+                if ("/viewer/wasm/openjpeg.wasm".equals(path) ||
+                        "/viewer/wasm/qcms_bg.wasm".equals(path)) {
+                    return fromAsset("application/wasm", path);
+                }
+
+                if (path != null && path.matches("^/viewer/iccs/.*\\.icc$")) {
+                    return fromAsset("application/vnd.iccprofile", path);
+                }
+
+                if (path != null && path.matches("^/viewer/cmaps/.*\\.bcmap$")) {
+                    return fromAsset("application/octet-stream", path);
+                }
+
+                if (path != null && path.matches("^/viewer/standard_fonts/.*\\.pfb$")) {
+                    return fromAsset("application/octet-stream", path);
+                }
+
+                if (path != null && path.matches("^/viewer/standard_fonts/.*\\.ttf$")) {
+                    return fromAsset("font/sfnt", path);
                 }
 
                 return null;
@@ -299,6 +365,19 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
                 mDocumentState = STATE_LOADED;
                 activity.invalidateOptionsMenu();
                 loadPdfWithPassword(mEncryptedDocumentPassword);
+            }
+
+            @RequiresApi(api = Build.VERSION_CODES.O)
+            @Override
+            public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                if (detail.didCrash()) {
+                    webViewCrashed = true;
+                    showWebViewCrashed();
+                    activity.invalidateOptionsMenu();
+                    purgeWebView();
+                    return true;
+                }
+                return false;
             }
         });
 
@@ -319,13 +398,8 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
                     }
 
                     @Override
-                    public void onZoomIn(float value) {
-                        zoomIn(value, false);
-                    }
-
-                    @Override
-                    public void onZoomOut(float value) {
-                        zoomOut(value, false);
+                    public void onZoom(float scaleFactor, float focusX, float focusY) {
+                        zoom(scaleFactor, focusX, focusY, false);
                     }
 
                     @Override
@@ -339,12 +413,25 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
         mTextView.setTextColor(ColorStateList.valueOf(Color.WHITE));
         mTextView.setTextSize(18);
         mTextView.setPadding(PADDING, 0, PADDING, 0);
+
+        binding.webviewAlertReload.setOnClickListener(v -> {
+            webViewCrashed = false;
+            activity.recreate();
+        });
+
+        if (webViewCrashed) {
+            showWebViewCrashed();
+        }
     }
 
-    public void onDestroy() {
+    private void purgeWebView() {
         binding.webview.removeJavascriptInterface("channel");
         binding.getRoot().removeView(binding.webview);
         binding.webview.destroy();
+    }
+
+    public void onDestroy() {
+        purgeWebView();
         maybeCloseInputStream();
     }
 
@@ -381,16 +468,19 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
     }
 
     public void onResume() {
-        // The user could have left the activity to update the WebView
-        activity.invalidateOptionsMenu();
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (getWebViewRelease() >= MIN_WEBVIEW_RELEASE) {
-                binding.webviewOutOfDateLayout.setVisibility(View.GONE);
-                binding.webview.setVisibility(View.VISIBLE);
-            } else {
-                binding.webview.setVisibility(View.GONE);
-                binding.webviewOutOfDateMessage.setText(activity.getString(R.string.webview_out_of_date_message, getWebViewRelease(), MIN_WEBVIEW_RELEASE));
-                binding.webviewOutOfDateLayout.setVisibility(View.VISIBLE);
+        if (!webViewCrashed) {
+            // The user could have left the activity to update the WebView
+            activity.invalidateOptionsMenu();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (getWebViewRelease() >= MIN_WEBVIEW_RELEASE) {
+                    binding.webviewAlertLayout.setVisibility(View.GONE);
+                    binding.webview.setVisibility(View.VISIBLE);
+                } else {
+                    binding.webview.setVisibility(View.GONE);
+                    binding.webviewAlertTitle.setText(activity.getString(R.string.webview_out_of_date_title));
+                    binding.webviewAlertMessage.setText(activity.getString(R.string.webview_out_of_date_message, getWebViewRelease(), MIN_WEBVIEW_RELEASE));
+                    binding.webviewAlertLayout.setVisibility(View.VISIBLE);
+                }
             }
         }
     }
@@ -411,6 +501,7 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
     @Override
     public void onLoadFinished(@NonNull Loader<List<CharSequence>> loader, List<CharSequence> data) {
         mDocumentProperties = data;
+        activity.invalidateOptionsMenu();
         setToolbarTitleWithDocumentName();
         LoaderManager.getInstance(activity).destroyLoader(DocumentPropertiesAsyncTaskLoader.ID);
     }
@@ -421,6 +512,7 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
     }
 
     public void loadPdf(ByteArrayInputStream inputStream, String fileName, Long fileSize) {
+        mDocumentState = 0;
         mPage = 1;
         mDocumentProperties = null;
         mInputStream = inputStream;
@@ -448,20 +540,12 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
         renderPage(0);
     }
 
-    private void zoomIn(float value, boolean end) {
-        if (mZoomRatio < MAX_ZOOM_RATIO) {
-            mZoomRatio = Math.min(mZoomRatio + value, MAX_ZOOM_RATIO);
-            renderPage(end ? 1 : 2);
-            activity.invalidateOptionsMenu();
-        }
-    }
-
-    private void zoomOut(float value, boolean end) {
-        if (mZoomRatio > MIN_ZOOM_RATIO) {
-            mZoomRatio = Math.max(mZoomRatio - value, MIN_ZOOM_RATIO);
-            renderPage(end ? 1 : 2);
-            activity.invalidateOptionsMenu();
-        }
+    private void zoom(float scaleFactor, float focusX, float focusY, boolean end) {
+        mZoomRatio = Math.min(Math.max(mZoomRatio * scaleFactor, MIN_ZOOM_RATIO), MAX_ZOOM_RATIO);
+        mZoomFocusX = focusX;
+        mZoomFocusY = focusY;
+        renderPage(end ? 1 : 2);
+        activity.invalidateOptionsMenu();
     }
 
     private void zoomEnd() {
@@ -469,12 +553,9 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
     }
 
     private static void enableDisableMenuItem(MenuItem item, boolean enable) {
-        if (enable) {
-            item.setEnabled(true);
-            item.getIcon().setAlpha(ALPHA_HIGH);
-        } else {
-            item.setEnabled(false);
-            item.getIcon().setAlpha(ALPHA_LOW);
+        item.setEnabled(enable);
+        if (item.getIcon() != null) {
+            item.getIcon().setAlpha(enable ? ALPHA_HIGH : ALPHA_LOW);
         }
     }
 
@@ -521,9 +602,10 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
         final ArrayList<Integer> ids = new ArrayList<>(Arrays.asList(R.id.action_jump_to_page,
                 R.id.action_next, R.id.action_previous, R.id.action_first, R.id.action_last,
                 R.id.action_rotate_clockwise, R.id.action_rotate_counterclockwise,
-                R.id.action_view_document_properties));
+                R.id.action_view_document_properties, R.id.action_outline));
         if (BuildConfig.DEBUG) {
             ids.add(R.id.debug_action_toggle_text_layer_visibility);
+            ids.add(R.id.debug_action_crash_webview);
         }
         if (mDocumentState < STATE_LOADED) {
             for (final int id : ids) {
@@ -544,6 +626,16 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
 
         enableDisableMenuItem(menu.findItem(R.id.action_next), mPage < mNumPages);
         enableDisableMenuItem(menu.findItem(R.id.action_previous), mPage > 1);
+        enableDisableMenuItem(menu.findItem(R.id.action_view_document_properties),
+                mDocumentProperties != null);
+
+        menu.findItem(R.id.action_outline).setVisible(viewModel.hasOutline());
+
+        if (webViewCrashed) {
+            for (final int id : ids) {
+                enableDisableMenuItem(menu.findItem(id), false);
+            }
+        }
 
         return true;
     }
@@ -568,6 +660,16 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
         } else if (itemId == R.id.action_rotate_counterclockwise) {
             documentOrientationChanged(-90);
             return true;
+        } else if (itemId == R.id.action_outline) {
+            OutlineFragment outlineFragment =
+                    OutlineFragment.newInstance(mPage, getCurrentDocumentName());
+            activity.getSupportFragmentManager().beginTransaction()
+                    .setTransition(FragmentTransaction.TRANSIT_FRAGMENT_OPEN)
+                    // fullscreen fragment, since content root view == activity's root view
+                    .add(android.R.id.content, outlineFragment)
+                    .addToBackStack(null)
+                    .commit();
+            return true;
         } else if (itemId == R.id.action_view_document_properties) {
             DocumentPropertiesFragment
                 .newInstance(mDocumentProperties)
@@ -579,6 +681,9 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
             return true;
         } else if (itemId == R.id.debug_action_toggle_text_layer_visibility) {
             binding.webview.evaluateJavascript("toggleTextLayerVisibility()", null);
+            return true;
+        } else if (itemId == R.id.debug_action_crash_webview) {
+            binding.webview.loadUrl("chrome://crash");
             return true;
         }
 
