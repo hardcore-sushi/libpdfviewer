@@ -23,10 +23,10 @@ import android.webkit.WebViewClient;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import androidx.activity.EdgeToEdge;
 import androidx.annotation.NonNull;
 import androidx.annotation.RequiresApi;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.view.WindowCompat;
 import androidx.fragment.app.Fragment;
 import androidx.fragment.app.FragmentTransaction;
 import androidx.lifecycle.ViewModelProvider;
@@ -238,6 +238,8 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
 
     public PdfViewer(@NonNull AppCompatActivity activity) {
         this.activity = activity;
+        WindowCompat.setDecorFitsSystemWindows(activity.getWindow(), false);
+
         binding = PdfviewerBinding.inflate(activity.getLayoutInflater());
         activity.setContentView(binding.getRoot());
         activity.setSupportActionBar(binding.toolbar);
@@ -261,8 +263,6 @@ public class PdfViewer implements LoaderManager.LoaderCallbacks<List<CharSequenc
                 onJumpToPageInDocument(newPage);
             }
         });
-
-        EdgeToEdge.enable(activity);
 
         // Margins for the toolbar are needed, so that content of the toolbar
         // is not covered by a system button navigation bar when in landscape.
