@@ -11,7 +11,6 @@ if (useKeystoreProperties) {
 
 plugins {
     id("com.android.library")
-    id("kotlin-android")
 }
 
 java {
@@ -67,10 +66,12 @@ android {
             }
         }
 
-        buildFeatures {
-            viewBinding = true
-            buildConfig = true
-        }
+    }
+
+    buildFeatures {
+        viewBinding = true
+        buildConfig = true
+        resValues = true
     }
 }
 
