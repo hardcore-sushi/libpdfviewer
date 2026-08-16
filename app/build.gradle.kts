@@ -13,12 +13,6 @@ plugins {
     id("com.android.library")
 }
 
-java {
-    toolchain {
-        languageVersion.set(JavaLanguageVersion.of(17))
-    }
-}
-
 android {
     if (useKeystoreProperties) {
         signingConfigs {
@@ -46,6 +40,11 @@ android {
 
     defaultConfig {
         minSdk = 21
+    }
+
+    compileOptions {
+        targetCompatibility = JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_17
     }
 
     buildTypes {
